@@ -39,7 +39,10 @@
 #include "netprefs_intern.h"
 
 static CONST_STRPTR NetworkTabs[] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-static CONST_STRPTR DHCPCycle[] = { NULL, NULL, NULL, NULL };
+/* DNS mode cycle in the main window: DNS from DHCP or from the two DNS fields */
+#define DNSMODE_DHCP    0
+#define DNSMODE_MANUAL  1
+static CONST_STRPTR DHCPCycle[] = { NULL, NULL, NULL };
 static CONST_STRPTR EncCycle[] = { NULL, NULL, NULL, NULL };
 static CONST_STRPTR KeyCycle[] = { NULL, NULL, NULL };
 static CONST_STRPTR ServiceTypeCycle[] = { NULL, NULL };
@@ -595,7 +598,7 @@ BOOL Gadgets2NetworkPrefs(struct NetPEditor_DATA *data)
     GET(data->netped_Autostart, MUIA_Selected, &lng);
     SetAutostart(lng);
     GET(data->netped_DHCPState, MUIA_Cycle_Active, &lng);
-    SetDHCP(lng);
+    SetDHCP(lng == DNSMODE_DHCP);
 
     entries = XGET(data->netped_hostList, MUIA_List_Entries);
     for(i = 0; i < entries; i++)
@@ -702,7 +705,7 @@ BOOL NetworkPrefs2Gadgets
     NNSET(data->netped_hostString, MUIA_String_Contents, (IPTR)GetHostname());
     NNSET(data->netped_domainString, MUIA_String_Contents, (IPTR)GetDomain());
     NNSET(data->netped_Autostart, MUIA_Selected, (IPTR)GetAutostart());
-    NNSET(data->netped_DHCPState, MUIA_Cycle_Active, (IPTR)GetDHCP() ? 1 : 0);
+    NNSET(data->netped_DHCPState, MUIA_Cycle_Active, (IPTR)(GetDHCP() ? DNSMODE_DHCP : DNSMODE_MANUAL));
 
     entries = GetHostCount();
 
@@ -1002,9 +1005,8 @@ Object * NetPEditor__OM_NEW(Class *CLASS, Object *self, struct opSet *message)
             *serverService, *serverUser, *serverGroup, *serverPass,
             *serverApplyButton, *serverCloseButton;
 
-    DHCPCycle[0] = _(MSG_IP_MODE_DHCP);
-    DHCPCycle[1] = _(MSG_IP_MODE_AUTO);
-    DHCPCycle[2] = _(MSG_IP_MODE_MANUAL);
+    DHCPCycle[DNSMODE_DHCP] = _(MSG_IP_MODE_DHCP);
+    DHCPCycle[DNSMODE_MANUAL] = _(MSG_IP_MODE_MANUAL);
 
     EncCycle[0] = _(MSG_ENC_NONE);
     EncCycle[1] = _(MSG_ENC_WEP);
@@ -2208,7 +2210,7 @@ IPTR NetPEditor__MUIM_NetPEditor_IPModeChanged
      * changes are handled internally by Net4WinClass / Net6WinClass */
     GetAttr(MUIA_Cycle_Active, data->netped_DHCPState, &lng);
 
-    if (lng == 1)
+    if (lng == DNSMODE_DHCP)
     {
         /* DHCP: DNS is supplied automatically */
         SET(data->netped_DNSString[0], MUIA_Disabled, TRUE);
