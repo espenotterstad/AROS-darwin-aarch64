@@ -1,0 +1,18 @@
+; Does a timer wait complete? (run-suite.sh STARTUP=…: the run ends when suite-done.txt is written)
+FailAt 21
+Echo "## probe start" >DEBUG:
+Date >DEBUG:
+; Does the clock move? (no waits: spins on the host clock, reports EClock/uptime against it)
+SYS:ticklag forbid dis3 mark >DEBUG:
+Echo "ticklag rc $RC" >DEBUG:
+; Timer reply vs task wake-up (repro/waitprobe.c)
+SYS:waitprobe >DEBUG:
+Echo "waitprobe rc $RC" >DEBUG:
+Wait 2
+Echo "## probe waited 2 s" >DEBUG:
+Date >DEBUG:
+SYS:Developer/Debug/Tests/timer/getsystime 1 >DEBUG:
+SYS:ticklag idle >DEBUG:
+Echo "ticklag rc $RC" >DEBUG:
+Echo "done" >SYS:hosted-timer-results/suite-done.txt
+Echo "## probe end" >DEBUG:

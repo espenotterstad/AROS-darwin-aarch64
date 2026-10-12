@@ -1,0 +1,233 @@
+# Hosted timer.device regression test (B20 (b)): builds a hosted target at the fix branch's upstream base, runs the
+# suite (ci/hosted-timer/run-suite.sh) with the upstream timer, swaps in the fix's timer.device, runs it again, then
+# once more with the fix forced onto its fallback path (no clock_gettime).
+# Branch layout: <upstream base> -> <fix commit> -> <this test commit>, so the base is HEAD~2 and the fix HEAD~1.
+name: hosted-timer
+
+on:
+  push:
+    branches: [ 'test/hosted-timer*' ]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # as upstream's nightlies (Azure definitions 18 and 21): x86_64 with GCC 13.5.0, i386 with the default
+          - target: linux-x86_64
+            gcc: '13.5.0'
+          - target: linux-i386
+            gcc: ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      W: /mnt/aros
+      TARGET: ${{ matrix.target }}
+      CCACHE_DIR: /mnt/aros/ccache
+      GCCOPT: ${{ matrix.gcc && format('--with-gcc-version={0}', matrix.gcc) || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+          path: src
+          submodules: true    # catalogs, translations: rom/dos needs the catalog strings
+
+      - name: Workspace and dependencies
+        run: |
+          sudo mkdir -p $W && sudo chown $USER $W
+          mkdir -p $W/build $W/toolchain $W/portssources $W/ccache $W/results
+          sudo apt-get update -y
+          # upstream's list (scripts/azure/templates/steps-prepare-host.yml)
+          sudo apt-get install -y libpng-dev zlib1g-dev libxcursor-dev libgl1-mesa-dev libasound2-dev
+          sudo apt-get install -y gawk bison flex netpbm automake cmake genisoimage
+          sudo apt-get install -y meson ninja-build python3-mako python3-yaml
+          sudo apt-get install -y libswitch-perl gperf gcc-multilib g++ ccache libclang-dev
+          sudo apt-get install -y jlha-utils wget liblzma-dev mtools xorriso nasm pkg-config strace
+          df -h / /mnt
+
+      - name: Record commits
+        working-directory: src
+        run: |
+          git log --oneline -3 | tee $W/results/commits.txt
+          git rev-parse HEAD~2 > $W/base.sha
+          git diff --stat HEAD~2 HEAD~1 | tee -a $W/results/commits.txt
+
+      - name: Restore toolchain
+        id: tc
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/aros/toolchain
+          key: toolchain-${{ matrix.target }}-gcc${{ matrix.gcc }}-${{ hashFiles('src/tools/crosstools/**', 'src/configure') }}
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/aros/ccache
+          key: ccache-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.target }}-
+
+      # Test-only, in all three builds: be37a66e96's local reply lists in rom/timer/lowlevel.c are compiled away by gcc
+      # (strict aliasing: no ReplyMsg left in TimerProcessVBlank), so no timer request is ever replied on gcc targets.
+      # Exec's AddTail()/RemHead() keep them. Not part of the fix under test.
+      - name: Check out the upstream timer (base)
+        working-directory: src
+        run: |
+          git checkout HEAD~2 -- arch/all-unix/timer
+          git rm -q --cached arch/all-unix/timer/ticks.c 2>/dev/null; rm -f arch/all-unix/timer/ticks.c
+          git apply ci/hosted-timer/rom-timer-replies.patch
+          echo "test-only: ci/hosted-timer/rom-timer-replies.patch applied to rom/timer/lowlevel.c in all builds" | tee -a $W/results/commits.txt
+          git status --short
+
+      - name: Build the toolchain
+        if: steps.tc.outputs.cache-hit != 'true'
+        working-directory: /mnt/aros/build
+        run: |
+          $GITHUB_WORKSPACE/src/configure --target=$TARGET --enable-ccache --enable-build-type=nightly $GCCOPT \
+            --with-portssources=$W/portssources --with-aros-toolchain-install=$W/toolchain --enable-unit-tests=yes \
+            > $W/results/configure-toolchain.log 2>&1 || { tail -50 $W/results/configure-toolchain.log; exit 1; }
+          make -j4 crosstools > $W/results/crosstools.log 2>&1 || { tail -80 $W/results/crosstools.log; exit 1; }
+
+      # Saved now, not at the end: a later failure would otherwise throw the toolchain away
+      - name: Save toolchain
+        if: steps.tc.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /mnt/aros/toolchain
+          key: ${{ steps.tc.outputs.cache-primary-key }}
+
+      - name: Build the system (base)
+        working-directory: /mnt/aros/build
+        run: |
+          $GITHUB_WORKSPACE/src/configure --target=$TARGET --enable-ccache --enable-build-type=nightly $GCCOPT \
+            --with-portssources=$W/portssources --with-aros-toolchain-install=$W/toolchain --with-aros-toolchain=yes \
+            --enable-unit-tests=yes > $W/results/configure.log 2>&1 || { tail -50 $W/results/configure.log; exit 1; }
+          make -j4 > $W/results/build-base.log 2>&1 || { grep -n -B5 -A5 'Error' $W/results/build-base.log | tail -80; exit 1; }
+          df -h /mnt
+          ccache -s | head -20
+
+      - name: Save ccache
+        uses: actions/cache/save@v4
+        with:
+          path: /mnt/aros/ccache
+          key: ccache-${{ matrix.target }}-${{ github.run_id }}
+
+      # As the build compiles programs: --sysroot $(AROS_DEVELOPER), gcc's linker is collect-aros from the host tools, and
+      # -fno-common (CONFIG_CFLAGS has $(CFLAGS_NO_COMMON)): gcc < 10 defaults to -fcommon, and LoadSeg refuses a COMMON
+      # symbol as a bad hunk ("file is not executable": every i386 run up to run 8, gcc 6.5.0)
+      - name: Build ticklag
+        run: |
+          B=$W/build/bin/$TARGET/AROS; echo "AROS=$B" >> $GITHUB_ENV
+          CC=$(ls $W/toolchain/*-aros-gcc | head -1); echo "using $CC"; $CC --version | head -1
+          export PATH=$(dirname $(ls $W/build/bin/*/tools/collect-aros | head -1)):$PATH
+          F=$B/Developer/Debug/Tests/misc/frequencies
+          relocs() { readelf -rW "$1" | awk '/^ *[0-9a-f]+ +[0-9a-f]+ +R_/ {print $3}' | sort | uniq -c; }
+          # waitprobe reads timer.device's internals: the source tree holds the upstream timer files at this point
+          TI="-I $GITHUB_WORKSPACE/src/arch/all-unix/timer -I $GITHUB_WORKSPACE/src/rom/timer"
+          for p in ticklag waitprobe; do
+            inc=; [ $p = waitprobe ] && inc=$TI
+            $CC --sysroot $B/Developer -v -O2 -fno-common -s $inc $GITHUB_WORKSPACE/src/ci/hosted-timer/$p.c -o $W/$p \
+              > $W/results/$p-build.log 2>&1 || { cat $W/results/$p-build.log; exit 1; }
+            grep -E 'warning' $W/results/$p-build.log || true
+            readelf -h $W/$p | grep -E 'Class|Type|Machine'
+            if readelf -sW $W/$p | awk '$7 == "COM"' | grep .; then echo "::error::$p has COMMON symbols"; exit 1; fi
+            [ "$(readelf -h $W/$p | grep Type:)" = "$(readelf -h $F | grep Type:)" ]
+            echo "$p relocation types:"; relocs $W/$p
+          done
+          echo "frequencies relocation types:"; relocs $F
+          for f in $W/ticklag $F; do echo "== $f"; readelf -SW $f | grep -E '^ *\[' ; done
+          (cd $B && find . -type f ! -path './hosted-timer-results/*' -print0 | xargs -0 sha1sum | sort -k2) > $W/sha-base.txt
+
+      - name: Preflight (everything the suite needs was built)
+        run: |
+          host=${TARGET%%-*}
+          missing=0
+          for f in boot/$host/AROSBootstrap Storage/Drivers/headlessgfx.hidd \
+                   Developer/Debug/Tests/cunit/exec/cunit-exec-types Developer/Debug/Tests/misc/frequencies \
+                   Developer/Debug/Tests/timer/getsystime Developer/Debug/Tests/crt/stdc/clock \
+                   Developer/Debug/Tests/crt/posix/usleep Developer/Debug/Tests/exec/childwait \
+                   Developer/Debug/Tests/exec/childstatus Devs/DOSDrivers/DEBUG; do
+            [ -e "$AROS/$f" ] || { echo "::error::missing $f"; missing=1; }
+          done
+          exit $missing
+
+      # Which launch lets a timer wait complete on this runner (run 3: none of Wait/Delay returned)
+      - name: Probe launch variants (base timer)
+        run: |
+          S=src/ci/hosted-timer
+          chosen=
+          # last: the same boot under strace (did setitimer run, do SIGALRMs arrive?)
+          for v in setsid:null:512: plain:pipe:none: setsid:null:512:strace; do
+            IFS=: read l i m t <<< "$v"
+            o=$W/results/probe-$l-$i-$m${t:+-$t}
+            rc=0
+            STAGE=$W/waitprobe LAUNCH=$l STDIN=$i MEM=$m STRACE=$t STARTUP=$S/probe-startup bash $S/run-suite.sh $AROS $GITHUB_WORKSPACE/src $W/ticklag $o 150 || rc=$?
+            echo "rc $rc" >> $o/elapsed.txt
+            ok=no; grep -q '## probe waited' $o/aros.log && grep -q '^result ' $o/aros.log && ok=yes
+            echo "probe $v: timer wait completed: $ok ($(cat $o/elapsed.txt | tr '\n' ' '))" | tee -a $W/results/probes.txt
+            grep -E '^ *(forbid|dis3|mark|vblank|microhz) |not executable' $o/aros.log | sed 's/^/    /' | tee -a $W/results/probes.txt
+            if [ -f $o/strace.txt ]; then
+              grep -v SIGALRM $o/strace.txt | head -10 | sed 's/^/    /' | tee -a $W/results/probes.txt
+              echo "    SIGALRM deliveries: $(grep -c SIGALRM $o/strace.txt)" | tee -a $W/results/probes.txt
+            fi
+            [ $ok = yes ] && [ -z "$chosen" ] && [ -z "$t" ] && chosen=$v
+          done
+          [ -n "$chosen" ] || { echo "::error::no launch variant completed a timer wait"; exit 1; }
+          IFS=: read l i m t <<< "$chosen"
+          echo "suite launch: $chosen" | tee -a $W/results/probes.txt
+          { echo "LAUNCH=$l"; echo "STDIN=$i"; echo "MEM=$m"; } >> $GITHUB_ENV
+
+      - name: Suite, base timer
+        run: bash src/ci/hosted-timer/run-suite.sh $AROS $GITHUB_WORKSPACE/src $W/ticklag $W/results/base 600 || echo "::warning::base suite rc $?"
+
+      - name: Build the fix's timer
+        working-directory: /mnt/aros/build
+        run: |
+          (cd $GITHUB_WORKSPACE/src && git checkout HEAD~1 -- arch/all-unix/timer && git status --short)
+          make kernel-timer-quick > $W/results/build-fix.log 2>&1 || { tail -60 $W/results/build-fix.log; exit 1; }
+          grep -iE 'warning|error' $W/results/build-fix.log | tee $W/results/build-fix-warnings.txt || true
+          (cd $AROS && find . -type f ! -path './hosted-timer-results/*' -print0 | xargs -0 sha1sum | sort -k2) > $W/sha-fix.txt
+          diff $W/sha-base.txt $W/sha-fix.txt | tee $W/results/changed-files.txt || true
+
+      - name: Suite, fix
+        run: bash src/ci/hosted-timer/run-suite.sh $AROS $GITHUB_WORKSPACE/src $W/ticklag $W/results/fix 600 || echo "::warning::fix suite rc $?"
+
+      - name: Build the fix forced onto its fallback
+        working-directory: /mnt/aros/build
+        run: |
+          sed -i 's/"clock_gettime", NULL);/"clock_gettime_fallback_test", NULL);/' $GITHUB_WORKSPACE/src/arch/all-unix/timer/timer_init.c
+          grep -c clock_gettime_fallback_test $GITHUB_WORKSPACE/src/arch/all-unix/timer/timer_init.c
+          make kernel-timer-quick > $W/results/build-fallback.log 2>&1 || { tail -60 $W/results/build-fallback.log; exit 1; }
+
+      - name: Suite, fix on its fallback
+        run: bash src/ci/hosted-timer/run-suite.sh $AROS $GITHUB_WORKSPACE/src $W/ticklag $W/results/fallback 600 || echo "::warning::fallback suite rc $?"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## $TARGET"
+            echo '```'; cat $W/results/probes.txt 2>/dev/null; echo '```'
+            echo '```'; cat $W/results/commits.txt; echo '```'
+            echo "Files changed by the fix's rebuild:"; echo '```'; cat $W/results/changed-files.txt 2>/dev/null; echo '```'
+            python3 src/ci/hosted-timer/summarize.py base=$W/results/base fix=$W/results/fix fallback=$W/results/fallback
+          } | tee $W/results/summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-timer-${{ matrix.target }}
+          path: /mnt/aros/results
+
+      # Green only if every suite ran to its end
+      - name: Check the suites finished
+        run: |
+          bad=0
+          for r in base fix fallback; do
+            if [ ! -f $W/results/$r/suite-done.txt ] || grep -q 'timeout after' $W/results/$r/aros.log; then
+              echo "::error::$r suite did not finish"; bad=1
+            fi
+          done
+          exit $bad
