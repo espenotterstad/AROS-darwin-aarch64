@@ -6,7 +6,9 @@
  * UNIX-hosted timer driver.
  * Unix operating systems have only one usable timer, producing SIGALRM.
  * In this implementation we run the timer with a fixed frequency, which
- * is a multiple of VBlank frequency.
+ * is a multiple of VBlank frequency. Time itself is read from the host's
+ * clock (ticks.c), so ticks lost while interrupts are disabled don't
+ * slow it down.
  * TODO: Rewrite UNIX-hosted timer.device to use variable delays, for improved accuracy.
  */
 
@@ -61,10 +63,15 @@ int atoi(const char *nptr);
 /* Handle periodic timer and drive exec VBlank */
 static void TimerTick(struct TimerBase *TimerBase, struct ExecBase *SysBase)
 {
-    /* Increment EClock value and process microhz requests */
-    ADDTIME(&TimerBase->tb_CurrentTime, &TimerBase->tb_Platform.tb_VBlankTime);
-    ADDTIME(&TimerBase->tb_Elapsed, &TimerBase->tb_Platform.tb_VBlankTime);
-    TimerBase->tb_ticks_total++;
+    /* Update EClock value and process microhz requests */
+    if (TimerBase->tb_Platform.clock_gettime)
+        EClockUpdate(TimerBase);
+    else
+    {
+        ADDTIME(&TimerBase->tb_CurrentTime, &TimerBase->tb_Platform.tb_VBlankTime);
+        ADDTIME(&TimerBase->tb_Elapsed, &TimerBase->tb_Platform.tb_VBlankTime);
+        TimerBase->tb_ticks_total++;
+    }
 
     handleMicroHZ(TimerBase, SysBase);
 
@@ -73,10 +80,19 @@ static void TimerTick(struct TimerBase *TimerBase, struct ExecBase *SysBase)
     if (TimerBase->tb_Platform.tb_TimerCount == TimerBase->tb_Platform.tb_VBlankTicks)
     {
         vblank_Cause(SysBase);
-        handleVBlank(TimerBase, SysBase);
+        if (!TimerBase->tb_Platform.clock_gettime)
+            handleVBlank(TimerBase, SysBase);
 
         TimerBase->tb_Platform.tb_TimerCount = 0;
     }
+
+    /*
+     * With the host clock, VBlank unit requests are checked on every tick:
+     * their start time is read between ticks, so on VBlanks alone they
+     * would wait up to a VBlank longer.
+     */
+    if (TimerBase->tb_Platform.clock_gettime)
+        handleVBlank(TimerBase, SysBase);
 }
 
 #define KernelBase TimerBase->tb_KernelBase
@@ -98,6 +114,15 @@ static int Timer_Init(struct TimerBase *TimerBase)
     TimerBase->tb_Platform.setitimer = HostLib_GetPointer(TimerBase->tb_Platform.libcHandle, "setitimer", NULL);
     if (!TimerBase->tb_Platform.setitimer)
         return FALSE;
+
+    /* Optional: hosts without it (macOS before 10.12, glibc before 2.17) count a fixed period per tick */
+    TimerBase->tb_Platform.clock_gettime = HostLib_GetPointer(TimerBase->tb_Platform.libcHandle, "clock_gettime", NULL);
+    if (TimerBase->tb_Platform.clock_gettime)
+    {
+        HostLib_Lock();
+        EClockInit(TimerBase);
+        HostLib_Unlock();
+    }
 
     /* Install timer IRQ handler */
     TimerBase->tb_TimerIRQHandle = KrnAddIRQHandler(SIGALRM, TimerTick, TimerBase, SysBase);
